@@ -1,0 +1,724 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>横スク：ゴール旗でCLEAR＋スコア＋紙吹雪</title>
+  <style>
+    body { margin:0; background:#000; height:100vh; display:grid; place-items:center; font-family:system-ui,sans-serif; }
+    canvas { background:#000; border-radius:12px; outline:1px solid #222; }
+    .hint { color:#bbb; font-size:13px; margin-top:10px; text-align:center; }
+  </style>
+</head>
+<body>
+  <div>
+    <canvas id="c" width="900" height="520"></canvas>
+    <div class="hint">←→ / A D：移動　Space：ジャンプ / 開始 / タイトルへ（敵+100、ゴール旗でCLEAR）</div>
+  </div>
+
+<script>
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+const world = { width: 5200, groundY: 420, gravity: 0.8, deathY: 560 };
+
+// ===== 段差（障害物）=====
+const bumps = [
+  { x: 500,  w: 40,  h: 28 },
+  { x: 700,  w: 60,  h: 36 },
+  { x: 950,  w: 80,  h: 24 },
+  { x: 1300, w: 60,  h: 56 },
+  { x: 1500, w: 90,  h: 48 },
+  { x: 1900, w: 50,  h: 24 },
+  { x: 1980, w: 50,  h: 40 },
+  { x: 2060, w: 50,  h: 56 },
+  { x: 2500, w: 70,  h: 80 },
+
+  // 4〜5体目エリア
+  { x: 3360, w: 80,  h: 44 },
+  { x: 3660, w: 100, h: 28 },
+  { x: 4060, w: 90,  h: 56 },
+
+  // ゴール前に軽い段差（雰囲気）
+  { x: 4520, w: 120, h: 24 },
+];
+function bumpRect(b){ return { x: b.x, y: world.groundY - b.h, w: b.w, h: b.h }; }
+
+// ===== 穴（狭め版）=====
+const holes = [
+  { x: 820,  w: 80  },
+  { x: 1650, w: 120 },
+  { x: 2250, w: 140 },
+  { x: 3000, w: 160 },
+  { x: 3520, w: 90  },
+  { x: 3920, w: 90  },
+
+  // ゴール前に小さめの穴（お好みで消してOK）
+  { x: 4380, w: 90  },
+];
+function isOverHole(x){
+  for (const h of holes) if (x >= h.x && x <= h.x + h.w) return true;
+  return false;
+}
+
+// ===== 入力 =====
+const keys = new Set();
+let spacePressedThisFrame = false;
+
+addEventListener("keydown", e => {
+  if ([" ", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) e.preventDefault();
+  if (e.key === " " && !keys.has(" ")) spacePressedThisFrame = true;
+  keys.add(e.key);
+});
+addEventListener("keyup", e => keys.delete(e.key));
+
+function jumpHeld(){ return keys.has(" ") || keys.has("ArrowUp") || keys.has("w") || keys.has("W"); }
+function rand(min,max){ return Math.random()*(max-min)+min; }
+function intersects(a,b){
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// ===== プレイヤー =====
+const start = { x: 100, y: 0 };
+const p = {
+  x:start.x, y:start.y, w:48, h:64,
+  vx:0, vy:0,
+  maxSpeed:5.2, accel:0.55, friction:0.82, airControl:0.55,
+  jumpPower:15, onGround:false,
+  wasJumpHeld:false, jumpCut:0.45
+};
+
+// ===== カメラ =====
+let camX = 0;
+
+// ===== 状態 =====
+let state = "TITLE"; // "TITLE" | "PLAY" | "DYING" | "GAME_OVER" | "CLEAR"
+
+// ===== スコア =====
+let score = 0;
+const scorePerEnemy = 100;
+
+// ===== 死亡演出（分裂）=====
+let deathParticles = [];
+let dyingAt = 0;
+const dyingDurationMs = 800;
+
+// ===== 砂ぼこり =====
+let dustParticles = [];
+const dustMax = 260;
+
+// ===== 紙吹雪（CLEAR演出）=====
+let confetti = [];
+const confettiMax = 320;
+
+// ===== 敵（5体）=====
+// 倒した数はスコアにのみ影響（CLEAR条件には関係しない）
+const enemies = [
+  { startX:1100, x:1100, y:world.groundY-28, size:28, dir: 1, speed:1.6, range:220, alive:true, squashT:0 },
+  { startX:2180, x:2180, y:world.groundY-28, size:28, dir:-1, speed:2.0, range:120, alive:true, squashT:0 },
+  { startX:2600, x:2600, y:world.groundY-28, size:28, dir: 1, speed:1.4, range:180, alive:true, squashT:0 },
+  { startX:3420, x:3420, y:world.groundY-28, size:28, dir: 1, speed:2.2, range:200, alive:true, squashT:0 },
+  { startX:3820, x:3820, y:world.groundY-28, size:28, dir:-1, speed:1.8, range:220, alive:true, squashT:0 },
+];
+
+function enemyRect(e){
+  const squash = e.squashT > 0 ? 0.45 : 1.0;
+  const h = e.size * squash;
+  return { x:e.x, y:e.y + (e.size - h), w:e.size, h };
+}
+
+// ===== ゴール旗 =====
+// 5体目（≈3820）の先に設置
+const goal = {
+  x: 4680,                 // ワールド座標
+  baseY: world.groundY,    // 地面
+  poleW: 10,
+  poleH: 140,
+  flagW: 70,
+  flagH: 40,
+};
+
+// ゴール判定用（旗周辺に当たりを持たせる）
+function goalRect(){
+  return { x: goal.x - 10, y: goal.baseY - goal.poleH, w: goal.flagW + 30, h: goal.poleH };
+}
+
+// ===== リセット =====
+function resetPlayerAndCamera(){
+  p.x=start.x; p.y=start.y; p.vx=0; p.vy=0;
+  p.onGround=false; p.wasJumpHeld=false;
+  camX=0;
+}
+function resetEnemies(){
+  for (const e of enemies){ e.x=e.startX; e.alive=true; e.squashT=0; }
+}
+
+function startGame(){
+  resetPlayerAndCamera();
+  resetEnemies();
+  deathParticles=[]; dustParticles=[]; confetti=[];
+  score = 0;
+  state="PLAY";
+}
+function goTitle(){
+  resetPlayerAndCamera();
+  resetEnemies();
+  deathParticles=[]; dustParticles=[]; confetti=[];
+  score = 0;
+  state="TITLE";
+}
+function setDying(){
+  state="DYING";
+  dyingAt=performance.now();
+  spawnDeathParticles();
+  p.vx=0; p.vy=0;
+}
+function setGameOver(){ state="GAME_OVER"; }
+function setClear(){
+  state="CLEAR";
+  spawnConfetti();
+}
+
+// ===== パーティクル：死亡分裂 =====
+function spawnDeathParticles(){
+  deathParticles=[];
+  const cols=2, rows=3;
+  const pw=Math.floor(p.w/cols), ph=Math.floor(p.h/rows);
+  for (let r=0;r<rows;r++){
+    for (let c=0;c<cols;c++){
+      const x=p.x+c*pw, y=p.y+r*ph;
+      const vx=rand(-3,3)+p.vx*0.35;
+      const vy=rand(-8,-3);
+      deathParticles.push({x,y,w:pw,h:ph,vx,vy,life:1});
+    }
+  }
+}
+
+// ===== パーティクル：砂ぼこり =====
+function spawnLandingDust(){
+  const baseX=p.x+p.w*0.5, baseY=p.y+p.h;
+  const count=10;
+  for (let i=0;i<count;i++){
+    dustParticles.push({
+      x:baseX+rand(-10,10),
+      y:baseY+rand(-2,2),
+      vx:rand(-2.2,2.2)+p.vx*0.25,
+      vy:rand(-3.8,-1.2),
+      life:1,
+      size:rand(2,4)
+    });
+  }
+  if (dustParticles.length>dustMax) dustParticles.splice(0,dustParticles.length-dustMax);
+}
+
+function spawnStompDust(ex,ey,amount=12){
+  for (let i=0;i<amount;i++){
+    dustParticles.push({
+      x:ex+rand(-8,8),
+      y:ey+rand(-2,2),
+      vx:rand(-2.6,2.6),
+      vy:rand(-4.6,-1.6),
+      life:1,
+      size:rand(2,4)
+    });
+  }
+  if (dustParticles.length>dustMax) dustParticles.splice(0,dustParticles.length-dustMax);
+}
+
+function stepDust(){
+  for (const pt of dustParticles){
+    pt.vy += world.gravity*0.35;
+    pt.x += pt.vx;
+    pt.y += pt.vy;
+    pt.vx *= 0.97;
+    pt.life -= 0.05;
+  }
+  dustParticles=dustParticles.filter(p=>p.life>0 && p.y<canvas.height+200);
+}
+
+// ===== 紙吹雪（クラッカー風）=====
+// 画面左右（スクリーン座標）から飛ばし、描画時にスクリーンで描く
+function spawnConfetti(){
+  confetti = [];
+  const countPerSide = 90;
+
+  for (let i=0;i<countPerSide;i++){
+    confetti.push({
+      sx: 0 - rand(0, 30),                 // screen x
+      sy: rand(60, canvas.height - 120),
+      vx: rand(3.5, 7.5),
+      vy: rand(-4.5, 2.0),
+      g: 0.22,
+      life: rand(120, 220),               // frames
+      size: rand(3, 6),
+      rot: rand(0, Math.PI*2),
+      vr: rand(-0.25, 0.25),
+    });
+    confetti.push({
+      sx: canvas.width + rand(0, 30),
+      sy: rand(60, canvas.height - 120),
+      vx: -rand(3.5, 7.5),
+      vy: rand(-4.5, 2.0),
+      g: 0.22,
+      life: rand(120, 220),
+      size: rand(3, 6),
+      rot: rand(0, Math.PI*2),
+      vr: rand(-0.25, 0.25),
+    });
+  }
+  if (confetti.length > confettiMax) confetti.length = confettiMax;
+}
+
+function stepConfetti(){
+  for (const c of confetti){
+    c.vy += c.g;
+    c.sx += c.vx;
+    c.sy += c.vy;
+    c.vx *= 0.995;
+    c.rot += c.vr;
+    c.life -= 1;
+  }
+  confetti = confetti.filter(c => c.life > 0 && c.sy < canvas.height + 80);
+}
+
+// ===== 死亡演出更新 =====
+function stepDying(){
+  for (const pt of deathParticles){
+    pt.vy += world.gravity*0.9;
+    pt.x += pt.vx;
+    pt.y += pt.vy;
+    pt.vx *= 0.995;
+    pt.life -= 1/(dyingDurationMs/16.67);
+    if (pt.life<0) pt.life=0;
+  }
+  if (performance.now()-dyingAt>=dyingDurationMs) setGameOver();
+}
+
+// ===== 敵：すり抜け防止＋詰まり解消 =====
+function enemyWouldHitBump(nextX, e){
+  const test = { x: nextX, y: e.y, w: e.size, h: e.size };
+  for (const b of bumps){
+    const r = bumpRect(b);
+    if (intersects(test, r)) return true;
+  }
+  return false;
+}
+function enemyWouldBeOverHole(nextX, e){
+  const center = nextX + e.size * 0.5;
+  return isOverHole(center);
+}
+function nudgeToFreeSpot(e){
+  if (!enemyWouldHitBump(e.x, e) && !enemyWouldBeOverHole(e.x, e)) return;
+  for (let d=1; d<=20; d++){
+    const rx = e.x + d;
+    if (!enemyWouldHitBump(rx, e) && !enemyWouldBeOverHole(rx, e)) { e.x = rx; e.dir = -1; return; }
+    const lx = e.x - d;
+    if (!enemyWouldHitBump(lx, e) && !enemyWouldBeOverHole(lx, e)) { e.x = lx; e.dir = 1; return; }
+  }
+}
+function stepEnemies(){
+  for (const e of enemies){
+    if (e.squashT>0){ e.squashT-=1; continue; }
+    if (!e.alive) continue;
+
+    nudgeToFreeSpot(e);
+
+    const leftBound = e.startX - e.range * 0.5;
+    const rightBound = e.startX + e.range * 0.5;
+
+    let nextX = e.x + e.dir * e.speed;
+
+    if (nextX < leftBound || nextX > rightBound) {
+      e.dir *= -1;
+      nextX = e.x + e.dir * e.speed;
+    }
+    if (enemyWouldBeOverHole(nextX, e)) {
+      e.dir *= -1;
+      nextX = e.x + e.dir * e.speed;
+    }
+    if (enemyWouldHitBump(nextX, e)) {
+      e.dir *= -1;
+      nextX = e.x + e.dir * e.speed;
+      if (enemyWouldHitBump(nextX, e) || enemyWouldBeOverHole(nextX, e)) {
+        let moved = false;
+        for (let i=0;i<10;i++){
+          const tryX = e.x + e.dir * 2;
+          if (!enemyWouldHitBump(tryX, e) && !enemyWouldBeOverHole(tryX, e)) {
+            e.x = tryX;
+            moved = true;
+            break;
+          }
+        }
+        if (!moved) nextX = e.x;
+      }
+    }
+
+    if (nextX < 0) { nextX = 0; e.dir = 1; }
+    if (nextX > world.width - e.size) { nextX = world.width - e.size; e.dir = -1; }
+
+    e.x = nextX;
+  }
+}
+
+// ===== PLAY処理 =====
+function stepPlay(){
+  const prevY=p.y;
+
+  const left  = keys.has("ArrowLeft") || keys.has("a") || keys.has("A");
+  const right = keys.has("ArrowRight")|| keys.has("d") || keys.has("D");
+  const jumpNow=jumpHeld();
+
+  const control=p.onGround?1:p.airControl;
+
+  if (left)  p.vx -= p.accel*control;
+  if (right) p.vx += p.accel*control;
+
+  if (!left && !right){
+    p.vx *= p.friction;
+    if (Math.abs(p.vx)<0.05) p.vx=0;
+  }
+
+  p.vx=Math.max(-p.maxSpeed,Math.min(p.maxSpeed,p.vx));
+
+  if (jumpNow && p.onGround){
+    p.vy=-p.jumpPower;
+    p.onGround=false;
+  }
+  if (p.wasJumpHeld && !jumpNow && p.vy<0) p.vy*=p.jumpCut;
+  p.wasJumpHeld=jumpNow;
+
+  p.vy += world.gravity;
+
+  const wasOnGround=p.onGround;
+
+  // X
+  p.x += p.vx;
+  if (p.x<0){ p.x=0; p.vx=0; }
+  if (p.x>world.width-p.w){ p.x=world.width-p.w; p.vx=0; }
+
+  let playerRect={x:p.x,y:p.y,w:p.w,h:p.h};
+  for (const b of bumps){
+    const r=bumpRect(b);
+    if (!intersects(playerRect,r)) continue;
+    if (p.vx>0){ p.x=r.x-p.w; p.vx=0; }
+    else if (p.vx<0){ p.x=r.x+r.w; p.vx=0; }
+    playerRect.x=p.x;
+  }
+
+  // Y
+  p.y += p.vy;
+  p.onGround=false;
+
+  const centerX=p.x+p.w*0.5;
+  const hasGroundHere=!isOverHole(centerX);
+
+  if (hasGroundHere){
+    const groundTop=world.groundY-p.h;
+    if (p.y>=groundTop){
+      p.y=groundTop; p.vy=0; p.onGround=true;
+    }
+  }
+
+  playerRect={x:p.x,y:p.y,w:p.w,h:p.h};
+  for (const b of bumps){
+    const r=bumpRect(b);
+    if (!intersects(playerRect,r)) continue;
+    if (p.vy>0){ p.y=r.y-p.h; p.vy=0; p.onGround=true; }
+    else if (p.vy<0){ p.y=r.y+r.h; p.vy=0; }
+    playerRect.y=p.y;
+  }
+
+  if (!wasOnGround && p.onGround) spawnLandingDust();
+
+  // 落下死
+  if (p.y>world.deathY){ setDying(); return; }
+
+  // 敵更新
+  stepEnemies();
+
+  // 敵当たり（踏みつけ優先）
+  const prevBottom=prevY+p.h;
+
+  for (const e of enemies){
+    if (!e.alive && e.squashT<=0) continue;
+    if (e.squashT>0) continue;
+
+    const er=enemyRect(e);
+    if (!intersects(playerRect,er)) continue;
+
+    const enemyTop=er.y;
+    const playerBottom=p.y+p.h;
+
+    const stomp = (p.vy>0) && (prevBottom<=enemyTop+2) && (playerBottom>=enemyTop);
+
+    if (stomp){
+      e.alive=false;
+      e.squashT=25;
+
+      // ★ スコアのみ
+      score += scorePerEnemy;
+      spawnStompDust(er.x+er.w/2, enemyTop);
+
+      // バウンド
+      p.vy = -p.jumpPower*0.65;
+      p.onGround=false;
+      continue;
+    } else {
+      setDying();
+      return;
+    }
+  }
+
+  // ★ ゴール到達判定（クリア条件はこれのみ）
+  const gr = goalRect();
+  if (intersects(playerRect, gr)) {
+    setClear();
+    return;
+  }
+
+  // カメラ
+  const lookAhead=p.vx*30;
+  const target=(p.x+lookAhead)-canvas.width*0.4;
+  camX += (target-camX)*0.12;
+  camX = Math.max(0, Math.min(world.width-canvas.width, camX));
+}
+
+// ===== メインstep =====
+function step(){
+  stepDust();
+
+  if (state==="TITLE"){
+    if (spacePressedThisFrame) startGame();
+    return;
+  }
+  if (state==="GAME_OVER"){
+    if (spacePressedThisFrame) goTitle();
+    return;
+  }
+  if (state==="CLEAR"){
+    stepConfetti();
+    if (spacePressedThisFrame) goTitle();
+    return;
+  }
+  if (state==="DYING"){
+    stepDying();
+    return;
+  }
+  stepPlay();
+}
+
+// ===== 描画 =====
+function drawGoalFlag(){
+  // ワールド座標で描く（カメラの影響を受ける）
+  const poleX = goal.x;
+  const poleTopY = goal.baseY - goal.poleH;
+
+  // 棒
+  ctx.fillStyle = "#ddd";
+  ctx.fillRect(poleX, poleTopY, goal.poleW, goal.poleH);
+
+  // 三角旗（右向き）
+  ctx.beginPath();
+  ctx.moveTo(poleX + goal.poleW, poleTopY + 25);
+  ctx.lineTo(poleX + goal.poleW + goal.flagW, poleTopY + 25 + goal.flagH/2);
+  ctx.lineTo(poleX + goal.poleW, poleTopY + 25 + goal.flagH);
+  ctx.closePath();
+  ctx.fillStyle = "#fff";
+  ctx.fill();
+
+  // 旗の縁（ちょい強調）
+  ctx.strokeStyle = "#aaa";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // 台座
+  ctx.fillStyle = "#444";
+  ctx.fillRect(poleX - 14, goal.baseY - 6, 40, 6);
+}
+
+function drawWorld(){
+  ctx.save();
+  ctx.translate(-camX,0);
+
+  // 地面
+  ctx.fillStyle="#111";
+  ctx.fillRect(0,world.groundY,world.width,canvas.height-world.groundY);
+
+  // 穴
+  ctx.fillStyle="#000";
+  for (const h of holes) ctx.fillRect(h.x, world.groundY, h.w, canvas.height-world.groundY);
+
+  // 目印
+  ctx.fillStyle="#222";
+  for (let x=0;x<world.width;x+=200) ctx.fillRect(x,world.groundY-12,4,12);
+
+  // 穴の縁
+  ctx.fillStyle="#1c1c1c";
+  for (const h of holes) ctx.fillRect(h.x, world.groundY-3, h.w, 3);
+
+  // 段差
+  ctx.fillStyle="#333";
+  for (const b of bumps){
+    const r=bumpRect(b);
+    ctx.fillRect(r.x,r.y,r.w,r.h);
+  }
+
+  // ゴール旗
+  drawGoalFlag();
+
+  // 敵
+  for (const e of enemies){
+    if (e.squashT>0){
+      const h=e.size*0.45;
+      ctx.fillStyle="#ff8a00";
+      ctx.fillRect(e.x, e.y+(e.size-h), e.size, h);
+    } else if (e.alive){
+      ctx.fillStyle="#ff8a00";
+      ctx.fillRect(e.x,e.y,e.size,e.size);
+    }
+  }
+
+  // プレイヤー（DYING中は描かない）
+  if (state==="PLAY" || state==="TITLE" || state==="GAME_OVER" || state==="CLEAR"){
+    ctx.fillStyle="#2d7cff";
+    ctx.fillRect(p.x,p.y,p.w,p.h);
+  }
+
+  // 死亡パーティクル
+  if (state==="DYING"){
+    for (const pt of deathParticles){
+      ctx.fillStyle=`rgba(45,124,255,${pt.life.toFixed(3)})`;
+      ctx.fillRect(pt.x,pt.y,pt.w,pt.h);
+    }
+  }
+
+  // 砂ぼこり
+  for (const d of dustParticles){
+    ctx.fillStyle=`rgba(180,180,180,${Math.max(0,d.life).toFixed(3)})`;
+    ctx.fillRect(d.x,d.y,d.size,d.size);
+  }
+
+  ctx.restore();
+}
+
+function drawConfetti(){
+  // スクリーン座標で描く（カメラ無関係）
+  for (const c of confetti){
+    ctx.save();
+    ctx.translate(c.sx, c.sy);
+    ctx.rotate(c.rot);
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(-c.size/2, -c.size/2, c.size, c.size*0.6);
+    ctx.restore();
+  }
+}
+
+function drawOverlayTitle(){
+  ctx.fillStyle="rgba(0,0,0,0.65)";
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  ctx.textAlign="center";
+  ctx.textBaseline="middle";
+
+  ctx.fillStyle="#fff";
+  ctx.font="bold 54px system-ui";
+  ctx.fillText("SIMPLE SIDE SCROLL", canvas.width/2, canvas.height/2-60);
+
+  const blink = Math.floor(performance.now()/500)%2===0;
+  ctx.fillStyle= blink ? "#fff" : "#777";
+  ctx.font="bold 28px system-ui";
+  ctx.fillText("PRESS SPACE TO START", canvas.width/2, canvas.height/2+10);
+
+  ctx.fillStyle="#bbb";
+  ctx.font="14px system-ui";
+  ctx.fillText("←→ / A D : Move   Space : Jump", canvas.width/2, canvas.height/2+55);
+
+  ctx.textAlign="start";
+  ctx.textBaseline="alphabetic";
+}
+
+function drawOverlayGameOver(){
+  ctx.fillStyle="rgba(0,0,0,0.65)";
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  ctx.textAlign="center";
+  ctx.textBaseline="middle";
+
+  ctx.fillStyle="#fff";
+  ctx.font="bold 64px system-ui";
+  ctx.fillText("GAME OVER", canvas.width/2, canvas.height/2-20);
+
+  ctx.fillStyle="#ddd";
+  ctx.font="bold 22px system-ui";
+  ctx.fillText("PRESS SPACE TO RETURN TO TITLE", canvas.width/2, canvas.height/2+40);
+
+  ctx.textAlign="start";
+  ctx.textBaseline="alphabetic";
+}
+
+function drawOverlayClear(){
+  // 紙吹雪
+  drawConfetti();
+
+  // 半透明暗幕
+  ctx.fillStyle="rgba(0,0,0,0.50)";
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  ctx.textAlign="center";
+  ctx.textBaseline="middle";
+
+  ctx.fillStyle="#fff";
+  ctx.font="bold 72px system-ui";
+  ctx.fillText("CLEAR!", canvas.width/2, canvas.height/2-60);
+
+  // ★ スコア表示
+  ctx.font="bold 30px system-ui";
+  ctx.fillText(`SCORE: ${score}`, canvas.width/2, canvas.height/2-10);
+
+  ctx.fillStyle="#ddd";
+  ctx.font="bold 20px system-ui";
+  ctx.fillText("PRESS SPACE TO RETURN TO TITLE", canvas.width/2, canvas.height/2+50);
+
+  ctx.textAlign="start";
+  ctx.textBaseline="alphabetic";
+}
+
+function drawOverlayDying(){
+  ctx.fillStyle="rgba(0,0,0,0.18)";
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+}
+
+function drawHud(){
+  ctx.fillStyle="#fff";
+  ctx.font="bold 20px system-ui";
+  ctx.fillText(`SCORE: ${score}`, 12, 28);
+
+  ctx.fillStyle="#bbb";
+  ctx.font="12px system-ui";
+  ctx.fillText(`state=${state}`, 12, 46);
+}
+
+function draw(){
+  ctx.fillStyle="#000";
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  drawWorld();
+  drawHud();
+
+  if (state==="TITLE") drawOverlayTitle();
+  if (state==="DYING") drawOverlayDying();
+  if (state==="GAME_OVER") drawOverlayGameOver();
+  if (state==="CLEAR") drawOverlayClear();
+}
+
+// ===== ループ =====
+function loop(){
+  step();
+  draw();
+  spacePressedThisFrame=false;
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
